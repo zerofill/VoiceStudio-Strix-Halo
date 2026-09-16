@@ -9,15 +9,19 @@ import {
   stat,
   statfs,
   writeFile,
+  access,
 } from 'node:fs/promises';
 import { join } from 'node:path';
 
 const SOURCES = ['backend', 'omnivoice', 'pyproject.toml', 'uv.lock', 'README.md', 'LICENSE'];
 export const UV_VERSION = '0.12.13'; // Kept in sync with the Tauri tools contract.
 export const CUDNN8_COMPAT_PIN = 'nvidia-cudnn-cu12==8.9.7.29';
-const RUNTIME_SCHEMA = 'electron-runtime-v2-cudnn8';
+const RUNTIME_SCHEMA = 'electron-runtime-v3-rocm';
 const CUDNN8_PROBE_PREFIX = 'VOICESTUDIO_CUDNN8_PROBE=';
 const REQUIRED_ENV_BYTES = 9 * 1024 ** 3; // Tauri setup.rs: REQUIRED_ENV_BYTES.
+// Keep in sync with bootstrap.rs / scripts/setup.py / [tool.uv.constraint-dependencies].
+export const ROCM_TORCH_INDEX = 'https://download.pytorch.org/whl/rocm6.4';
+export const ROCM_TORCH_PINS = ['torch==2.8.0', 'torchaudio==2.8.0', 'torchvision==0.23.0'] as const;
 export type RuntimePhase = 'checking' | 'downloading_uv' | 'installing_deps' | 'verifying';
 export type RuntimeRegion = 'auto' | 'global' | 'china' | 'russia' | 'restricted';
 export type RuntimeRunner = (
@@ -190,6 +194,94 @@ export async function clearCtranslate2ExecutableStack(
   return patched;
 }
 
+/** True when the host ROCm userspace is installed (matches Tauri setup.rs). */
+export async function rocmUserspacePresent(): Promise<boolean> {
+  if (process.platform !== 'linux') return false;
+  try {
+    await access('/opt/rocm');
+    return true;
+  } catch {
+    /* fall through */
+  }
+  const pathEntries = (process.env.PATH ?? '').split(':');
+  for (const entry of pathEntries) {
+    if (!entry) continue;
+    try {
+      await access(join(entry, 'rocminfo'));
+      return true;
+    } catch {
+      /* try next PATH entry */
+    }
+  }
+  return false;
+}
+
+/** AMD GPU via DRM vendor id 0x1002 (Strix Halo / RDNA). */
+export async function detectAmdGpuLinux(): Promise<boolean> {
+  if (process.platform !== 'linux') return false;
+  let entries: string[];
+  try {
+    entries = await readdir('/sys/class/drm');
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    try {
+      const vendor = (await readFile(join('/sys/class/drm', entry, 'device', 'vendor'), 'utf8')).trim();
+      if (vendor === '0x1002') return true;
+    } catch {
+      /* card without a readable vendor node */
+    }
+  }
+  return false;
+}
+
+/** Whether to swap the lockfile's CUDA torch for the ROCm wheel after `uv sync`. */
+export function rocmOptIn(configuredVariant = 'auto'): string | null {
+  const fromEnv = process.env.OMNIVOICE_TORCH_VARIANT?.trim();
+  const variant = (fromEnv || configuredVariant).toLowerCase();
+  if (variant === 'cuda' || variant === 'cpu') return null;
+  if (variant === 'rocm') return process.env.OMNIVOICE_TORCH_INDEX || ROCM_TORCH_INDEX;
+  return null;
+}
+
+export async function rocmOptInAsync(configuredVariant = 'auto'): Promise<string | null> {
+  const explicit = rocmOptIn(configuredVariant);
+  if (explicit) return explicit;
+  if (process.platform !== 'linux') return null;
+  if (!(await detectAmdGpuLinux())) return null;
+  return process.env.OMNIVOICE_TORCH_INDEX || ROCM_TORCH_INDEX;
+}
+
+export function rocmTorchReinstallArgs(rocmIndexUrl: string, python: string): string[] {
+  return [
+    'pip',
+    'install',
+    '--reinstall',
+    '--python',
+    python,
+    ...ROCM_TORCH_PINS,
+    '--index-url',
+    rocmIndexUrl,
+  ];
+}
+
+async function ensureRocmTorch(
+  uv: string,
+  project: string,
+  run: RuntimeRunner,
+  env: NodeJS.ProcessEnv,
+  signal: AbortSignal,
+  configuredVariant = 'auto',
+): Promise<void> {
+  if (process.platform !== 'linux') return;
+  const rocmIndex = await rocmOptInAsync(configuredVariant);
+  signal.throwIfAborted();
+  if (!rocmIndex) return;
+  await run(uv, rocmTorchReinstallArgs(rocmIndex, runtimePython(project)), project, env);
+  signal.throwIfAborted();
+}
+
 async function ensureCudnn8Compat(
   uv: string,
   project: string,
@@ -333,6 +425,7 @@ export async function installRuntime(
   signal: AbortSignal,
   phase: (value: RuntimePhase) => void = () => {},
   region: RuntimeRegion = 'auto',
+  configuredTorchVariant = 'auto',
 ): Promise<void> {
   signal.throwIfAborted();
   phase('checking');
@@ -400,6 +493,8 @@ export async function installRuntime(
   // uv owns platform resolution; the same frozen dependency graph is used by Tauri.
   phase('installing_deps');
   await run(uv, ['sync', '--frozen', '--no-dev', '--python', '3.11'], project, env);
+  signal.throwIfAborted();
+  await ensureRocmTorch(uv, project, run, env, signal, configuredTorchVariant);
   signal.throwIfAborted();
   await ensureCudnn8Compat(uv, project, run, env, signal);
   signal.throwIfAborted();

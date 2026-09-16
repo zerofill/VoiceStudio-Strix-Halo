@@ -1,0 +1,51 @@
+# VoiceStudio — Strix Halo / AMD ROCm (local build)
+#
+# Quick start:
+#   cp .env.example .env   # set OMNIVOICE_API_KEY
+#   ./scripts/build-docker.sh
+#   docker compose up -d
+#   ./scripts/verify-gpu.sh
+#
+# Open http://127.0.0.1:3900 after the health check passes.
+
+services:
+  voicestudio-rocm:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      args:
+        BASE_IMAGE: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
+        GPU_FLAVOR: rocm
+    image: voicestudio-strix-halo:rocm
+    container_name: voicestudio-strix-halo
+    ports:
+      - "127.0.0.1:3900:3900"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - ${RENDER_GID:-993}
+      - ${VIDEO_GID:-44}
+    volumes:
+      - voicestudio-data:/app/omnivoice_data
+    environment:
+      HF_HOME: /app/omnivoice_data/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
+      OMNIVOICE_DATA_DIR: /app/omnivoice_data
+      OMNIVOICE_BIND_HOST: 0.0.0.0
+      OMNIVOICE_SERVER_MODE: "1"
+      OMNIVOICE_API_KEY: ${OMNIVOICE_API_KEY:?set OMNIVOICE_API_KEY in .env}
+      PYTHONPATH: /app/backend
+      PYTHONUNBUFFERED: "1"
+      # Strix Halo (gfx1151) is natively supported in ROCm 7.2.4 — do NOT set
+      # HSA_OVERRIDE_GFX_VERSION unless diagnostics show a stale override hiding the GPU.
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:3900/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    restart: unless-stopped
+
+volumes:
+  voicestudio-data:

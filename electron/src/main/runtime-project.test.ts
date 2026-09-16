@@ -14,6 +14,10 @@ import {
   runtimeInstallInterrupted,
   stageRuntimeSources,
   UV_VERSION,
+  ROCM_TORCH_INDEX,
+  rocmOptIn,
+  rocmOptInAsync,
+  rocmTorchReinstallArgs,
 } from './runtime-project';
 
 vi.mock('node:fs/promises', async (importOriginal) => ({
@@ -101,7 +105,8 @@ describe('packaged runtime setup', () => {
       'installing_deps',
       'verifying',
     ]);
-    expect(run.mock.calls).toHaveLength(process.platform === 'darwin' ? 2 : 3);
+    const syncCalls = run.mock.calls.filter(([, args]) => args[0] === 'sync').length;
+    expect(syncCalls).toBe(1);
     expect(await runtimeReady(bundle, project)).toBe(true);
     await writeFile(join(bundle, 'uv.lock'), 'updated dependencies');
     expect(await runtimeReady(bundle, project)).toBe(false);
@@ -331,4 +336,41 @@ describe('packaged runtime setup', () => {
     );
     expect(release).toContain(`UV_VERSION: "${UV_VERSION}"`);
   });
+  it('honours explicit ROCm opt-in via OMNIVOICE_TORCH_VARIANT', () => {
+    vi.stubEnv('OMNIVOICE_TORCH_VARIANT', 'rocm');
+    expect(rocmOptIn()).toBe(ROCM_TORCH_INDEX);
+    vi.stubEnv('OMNIVOICE_TORCH_VARIANT', 'cuda');
+    expect(rocmOptIn()).toBeNull();
+  });
+  it('builds ROCm reinstall args matching the packaged Tauri bootstrap', () => {
+    const args = rocmTorchReinstallArgs(ROCM_TORCH_INDEX, '/venv/bin/python');
+    expect(args).toEqual([
+      'pip',
+      'install',
+      '--reinstall',
+      '--python',
+      '/venv/bin/python',
+      'torch==2.8.0',
+      'torchaudio==2.8.0',
+      'torchvision==0.23.0',
+      '--index-url',
+      ROCM_TORCH_INDEX,
+    ]);
+  });
+  it.skipIf(process.platform !== 'linux')(
+    'reinstalls ROCm torch after sync when an AMD GPU is present',
+    async () => {
+      const { bundle, project } = await fixture();
+      const hasAmd = await rocmOptInAsync();
+      if (!hasAmd) return;
+      const run = vi.fn(
+        async (_command: string, _args: string[], _cwd: string, _env?: NodeJS.ProcessEnv) => {
+          await interpreter(project);
+        },
+      );
+      await installRuntime(bundle, project, 'uv', run, new AbortController().signal);
+      const pipCall = run.mock.calls.find(([, args]) => args[0] === 'pip');
+      expect(pipCall?.[1]).toEqual(rocmTorchReinstallArgs(ROCM_TORCH_INDEX, runtimePython(project)));
+    },
+  );
 });
